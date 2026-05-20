@@ -1,12 +1,6 @@
 /**
  * PixelCouple Backend — server.js
- * Node.js + Express + Socket.io + flat-file JSON persistence
- *
- * Architecture:
- *  - Express serves a REST fallback  GET /api/status
- *  - Socket.io handles real-time bidirectional updates
- *  - data.json acts as a lightweight persistent store so state
- *    survives Render.com cold-starts / sleep cycles
+ * Features: Status, Mood Note, Daily Streak
  */
 
 const express = require("express");
@@ -16,22 +10,14 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
-// ─── Config ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 
-// Comma-separated list of allowed frontend origins.
-// Set the ALLOWED_ORIGINS env var on Render to your Vercel/Netlify URL.
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim())
-  : [
-      "http://localhost:5173", // Vite dev server default
-      "http://localhost:3000",
-    ];
+  : ["http://localhost:5173", "http://localhost:3000"];
 
-// ─── Flat-file DB ─────────────────────────────────────────────────────────────
 const DATA_FILE = path.join(__dirname, "data.json");
 
-/** Default state — used when data.json doesn't exist yet */
 const DEFAULT_STATE = {
   user_1: {
     id: "user_1",
@@ -39,7 +25,9 @@ const DEFAULT_STATE = {
     status: "Chilling",
     gif_url: "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
     location: "Home",
+    mood_note: "",
     updated_at: new Date().toISOString(),
+    last_seen_date: new Date().toISOString().slice(0, 10),
   },
   user_2: {
     id: "user_2",
@@ -47,29 +35,34 @@ const DEFAULT_STATE = {
     status: "Chilling",
     gif_url: "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
     location: "Home",
+    mood_note: "",
     updated_at: new Date().toISOString(),
+    last_seen_date: new Date().toISOString().slice(0, 10),
+  },
+  streak: {
+    count: 0,
+    last_both_active_date: "",
   },
 };
 
-/**
- * Reads state from data.json.
- * Falls back to DEFAULT_STATE if the file is missing or malformed.
- */
 function readState() {
   try {
-    if (!fs.existsSync(DATA_FILE)) return { ...DEFAULT_STATE };
+    if (!fs.existsSync(DATA_FILE)) return JSON.parse(JSON.stringify(DEFAULT_STATE));
     const raw = fs.readFileSync(DATA_FILE, "utf8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    // make sure streak and mood_note exist on old saves
+    if (!parsed.streak) parsed.streak = { count: 0, last_both_active_date: "" };
+    if (!parsed.user_1.mood_note) parsed.user_1.mood_note = "";
+    if (!parsed.user_2.mood_note) parsed.user_2.mood_note = "";
+    if (!parsed.user_1.last_seen_date) parsed.user_1.last_seen_date = "";
+    if (!parsed.user_2.last_seen_date) parsed.user_2.last_seen_date = "";
+    return parsed;
   } catch (err) {
     console.error("[DB] Failed to read data.json, using defaults:", err.message);
-    return { ...DEFAULT_STATE };
+    return JSON.parse(JSON.stringify(DEFAULT_STATE));
   }
 }
 
-/**
- * Writes the current state object to data.json atomically-ish.
- * Uses a temp-file + rename to avoid a partially-written file on crash.
- */
 function writeState(state) {
   try {
     const tmp = DATA_FILE + ".tmp";
@@ -80,73 +73,71 @@ function writeState(state) {
   }
 }
 
-// Initialise in-memory state from disk on startup
+// Updates streak when a user opens/connects
+function updateStreak(state, userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  state[userId].last_seen_date = today;
+
+  const u1Today = state.user_1.last_seen_date === today;
+  const u2Today = state.user_2.last_seen_date === today;
+
+  if (u1Today && u2Today) {
+    const lastBoth = state.streak.last_both_active_date;
+    if (lastBoth !== today) {
+      // Check if yesterday both were active (streak continues)
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+      if (lastBoth === yesterday) {
+        state.streak.count += 1;
+      } else if (lastBoth === "") {
+        state.streak.count = 1;
+      } else {
+        // Streak broken
+        state.streak.count = 1;
+      }
+      state.streak.last_both_active_date = today;
+    }
+  }
+  return state;
+}
+
 let appState = readState();
 console.log("[DB] State loaded from disk:", appState);
 
-// ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: ALLOWED_ORIGINS,
-    methods: ["GET", "POST"],
-  },
-  // Helps on flaky mobile connections
+  cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] },
   pingTimeout: 20000,
   pingInterval: 10000,
 });
 
-app.use(
-  cors({
-    origin: ALLOWED_ORIGINS,
-    methods: ["GET"],
-  })
-);
+app.use(cors({ origin: ALLOWED_ORIGINS, methods: ["GET"] }));
 app.use(express.json());
 
-// ─── REST fallback ─────────────────────────────────────────────────────────
-/**
- * GET /api/status
- * Called by the frontend on initial mount and after every reconnect
- * so the UI is never stuck displaying stale data.
- */
 app.get("/api/status", (req, res) => {
   res.json(appState);
 });
 
-// Simple health-check so Render uptime monitors can ping us
 app.get("/health", (req, res) => res.send("ok"));
 
-// ─── Socket.io Events ────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
   console.log(`[WS] Client connected: ${socket.id}`);
-
-  // Send the current full state immediately on connect so the new client
-  // is in sync right away (important after iOS wakes from background).
   socket.emit("state_update", appState);
 
-  /**
-   * update_status — emitted by a user when they change their status.
-   *
-   * Expected payload:
-   * {
-   *   userId: "user_1" | "user_2",
-   *   status: string,
-   *   gif_url: string,
-   *   location: string
-   * }
-   */
+  // User opened the app — update their last_seen and recalculate streak
+  socket.on("user_active", (payload) => {
+    const { userId } = payload;
+    if (!appState[userId]) return;
+    appState = updateStreak(appState, userId);
+    writeState(appState);
+    io.emit("state_update", appState);
+  });
+
   socket.on("update_status", (payload) => {
     const { userId, status, gif_url, location } = payload;
+    if (!appState[userId]) return;
 
-    if (!appState[userId]) {
-      console.warn(`[WS] Unknown userId: ${userId}`);
-      return;
-    }
-
-    // Merge update into in-memory state
     appState[userId] = {
       ...appState[userId],
       status,
@@ -155,12 +146,24 @@ io.on("connection", (socket) => {
       updated_at: new Date().toISOString(),
     };
 
-    // Persist to disk so the state survives cold-starts
     writeState(appState);
-
     console.log(`[WS] ${userId} updated → ${status} @ ${location}`);
+    io.emit("state_update", appState);
+  });
 
-    // Broadcast full state to ALL connected clients (both partners update)
+  // New: update mood note
+  socket.on("update_mood", (payload) => {
+    const { userId, mood_note } = payload;
+    if (!appState[userId]) return;
+
+    appState[userId] = {
+      ...appState[userId],
+      mood_note,
+      updated_at: new Date().toISOString(),
+    };
+
+    writeState(appState);
+    console.log(`[WS] ${userId} mood → "${mood_note}"`);
     io.emit("state_update", appState);
   });
 
@@ -169,7 +172,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`[Server] Listening on port ${PORT}`);
   console.log(`[Server] Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
