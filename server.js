@@ -167,6 +167,14 @@ io.on("connection", (socket) => {
     io.emit("state_update", appState);
   });
 
+  // Send flowers to partner
+  socket.on("send_flowers", (payload) => {
+    const { fromUserId, toUserId } = payload;
+    console.log(`[WS] 🌸 ${fromUserId} sent flowers to ${toUserId}`);
+    // Broadcast to ALL clients — frontend filters by toUserId
+    io.emit("send_flowers", { fromUserId, toUserId });
+  });
+
   socket.on("disconnect", (reason) => {
     console.log(`[WS] Client disconnected: ${socket.id} — ${reason}`);
   });
