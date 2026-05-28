@@ -1,7 +1,6 @@
 /**
  * PixelCouple Backend — server.js
- * Fixes: data persistence, streak, mood note
- * New: flowers notification, compliments
+ * Features: Status, Mood Note, Streak, Flowers, Compliments, Canvas, Playlist
  */
 
 const express = require("express");
@@ -29,6 +28,7 @@ const DEFAULT_STATE = {
     mood_note: "",
     updated_at: new Date().toISOString(),
     last_seen_date: "",
+    canvas: null, // base64 image data
   },
   user_2: {
     id: "user_2",
@@ -39,6 +39,7 @@ const DEFAULT_STATE = {
     mood_note: "",
     updated_at: new Date().toISOString(),
     last_seen_date: "",
+    canvas: null,
   },
   streak: {
     count: 0,
@@ -46,13 +47,13 @@ const DEFAULT_STATE = {
     user_1_last_date: "",
     user_2_last_date: "",
   },
-  // Pending flowers: { fromUserId, toUserId, sentAt }
   pending_flowers: null,
-  // Compliments: { from: user_1, to: user_2, text, sentAt } 
   compliments: {
-    user_1_to_2: null, // boyfriend -> girlfriend
-    user_2_to_1: null, // girlfriend -> boyfriend
+    user_1_to_2: null,
+    user_2_to_1: null,
   },
+  // Playlist: array of { id, addedBy, song, artist, youtubeUrl, note, addedAt }
+  playlist: [],
 };
 
 function readState() {
@@ -64,7 +65,6 @@ function readState() {
     }
     const raw = fs.readFileSync(DATA_FILE, "utf8");
     const parsed = JSON.parse(raw);
-    // Ensure all new fields exist on old saves
     if (!parsed.streak) parsed.streak = DEFAULT_STATE.streak;
     if (!parsed.streak.user_1_last_date) parsed.streak.user_1_last_date = "";
     if (!parsed.streak.user_2_last_date) parsed.streak.user_2_last_date = "";
@@ -74,6 +74,9 @@ function readState() {
     if (!parsed.user_2.mood_note) parsed.user_2.mood_note = "";
     if (!parsed.user_1.last_seen_date) parsed.user_1.last_seen_date = "";
     if (!parsed.user_2.last_seen_date) parsed.user_2.last_seen_date = "";
+    if (parsed.user_1.canvas === undefined) parsed.user_1.canvas = null;
+    if (parsed.user_2.canvas === undefined) parsed.user_2.canvas = null;
+    if (!parsed.playlist) parsed.playlist = [];
     return parsed;
   } catch (err) {
     console.error("[DB] Failed to read, using defaults:", err.message);
@@ -94,25 +97,17 @@ function writeState(state) {
 function updateStreak(state, userId) {
   const today = new Date().toISOString().slice(0, 10);
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-
-  // Update this user's last seen date
   if (userId === "user_1") state.streak.user_1_last_date = today;
   if (userId === "user_2") state.streak.user_2_last_date = today;
   state[userId].last_seen_date = today;
-
   const u1Today = state.streak.user_1_last_date === today;
   const u2Today = state.streak.user_2_last_date === today;
-
   if (u1Today && u2Today) {
     const lastBoth = state.streak.last_both_active_date;
     if (lastBoth !== today) {
-      if (lastBoth === yesterday) {
-        state.streak.count += 1;
-      } else if (!lastBoth) {
-        state.streak.count = 1;
-      } else {
-        state.streak.count = 1; // streak broken, restart
-      }
+      if (lastBoth === yesterday) state.streak.count += 1;
+      else if (!lastBoth) state.streak.count = 1;
+      else state.streak.count = 1;
       state.streak.last_both_active_date = today;
     }
   }
@@ -129,25 +124,20 @@ const io = new Server(server, {
   cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] },
   pingTimeout: 20000,
   pingInterval: 10000,
+  maxHttpBufferSize: 5e6, // 5MB for canvas data
 });
 
 app.use(cors({ origin: ALLOWED_ORIGINS, methods: ["GET"] }));
-app.use(express.json());
+app.use(express.json({ limit: "5mb" }));
 
-// REST fallback — always returns current state from data.json
 app.get("/api/status", (req, res) => res.json(appState));
-
-// Keep-alive endpoint for cron-job.org
 app.get("/health", (req, res) => res.send("ok"));
 app.get("/ping", (req, res) => res.send("pong"));
 
 io.on("connection", (socket) => {
   console.log(`[WS] Connected: ${socket.id}`);
-
-  // Send full current state immediately on connect
   socket.emit("state_update", appState);
 
-  // User opened app — update streak
   socket.on("user_active", ({ userId }) => {
     if (!appState[userId]) return;
     appState = updateStreak(appState, userId);
@@ -155,72 +145,86 @@ io.on("connection", (socket) => {
     io.emit("state_update", appState);
   });
 
-  // Update status
   socket.on("update_status", ({ userId, status, gif_url, location }) => {
     if (!appState[userId]) return;
-    appState[userId] = {
-      ...appState[userId],
-      status,
-      gif_url,
-      location,
-      updated_at: new Date().toISOString(),
-    };
+    appState[userId] = { ...appState[userId], status, gif_url, location, updated_at: new Date().toISOString() };
     writeState(appState);
     io.emit("state_update", appState);
-    console.log(`[WS] ${userId} → ${status}`);
   });
 
-  // Update mood note — persists until changed
   socket.on("update_mood", ({ userId, mood_note }) => {
     if (!appState[userId]) return;
-    appState[userId] = {
-      ...appState[userId],
-      mood_note,
-      updated_at: new Date().toISOString(),
-    };
+    appState[userId] = { ...appState[userId], mood_note, updated_at: new Date().toISOString() };
     writeState(appState);
     io.emit("state_update", appState);
-    console.log(`[WS] ${userId} mood → "${mood_note}"`);
   });
 
-  // Send flowers — saves as pending so recipient sees it when they open app
   socket.on("send_flowers", ({ fromUserId, toUserId }) => {
-    appState.pending_flowers = {
-      fromUserId,
-      toUserId,
-      sentAt: new Date().toISOString(),
-    };
+    appState.pending_flowers = { fromUserId, toUserId, sentAt: new Date().toISOString() };
     writeState(appState);
-    // Broadcast to all — if recipient is online they see it instantly
     io.emit("state_update", appState);
     io.emit("send_flowers", { fromUserId, toUserId });
-    console.log(`[WS] 🌸 ${fromUserId} sent flowers to ${toUserId}`);
   });
 
-  // Recipient cleared the flowers notification
   socket.on("clear_flowers", () => {
     appState.pending_flowers = null;
     writeState(appState);
     io.emit("state_update", appState);
   });
 
-  // Send compliment
   socket.on("send_compliment", ({ fromUserId, toUserId, text }) => {
     const key = `${fromUserId}_to_${toUserId.replace("user_", "")}`;
-    appState.compliments[key] = {
-      from: fromUserId,
-      to: toUserId,
-      text,
-      sentAt: new Date().toISOString(),
-    };
+    appState.compliments[key] = { from: fromUserId, to: toUserId, text, sentAt: new Date().toISOString() };
     writeState(appState);
     io.emit("state_update", appState);
-    console.log(`[WS] 💌 ${fromUserId} → compliment to ${toUserId}`);
   });
 
-  // Recipient dismissed compliment
   socket.on("dismiss_compliment", ({ key }) => {
     appState.compliments[key] = null;
+    writeState(appState);
+    io.emit("state_update", appState);
+  });
+
+  // Canvas — save drawing (base64 image)
+  socket.on("update_canvas", ({ userId, canvasData }) => {
+    if (!appState[userId]) return;
+    appState[userId] = { ...appState[userId], canvas: canvasData };
+    writeState(appState);
+    io.emit("state_update", appState);
+    console.log(`[WS] 🎨 ${userId} updated canvas`);
+  });
+
+  // Clear canvas
+  socket.on("clear_canvas", ({ userId }) => {
+    if (!appState[userId]) return;
+    appState[userId] = { ...appState[userId], canvas: null };
+    writeState(appState);
+    io.emit("state_update", appState);
+  });
+
+  // Add song to playlist
+  socket.on("add_song", ({ addedBy, song, artist, youtubeUrl, note }) => {
+    const newSong = {
+      id: Date.now().toString(),
+      addedBy,
+      song,
+      artist,
+      youtubeUrl,
+      note,
+      addedAt: new Date().toISOString(),
+    };
+    appState.playlist = [newSong, ...appState.playlist];
+    writeState(appState);
+    io.emit("state_update", appState);
+    console.log(`[WS] 🎵 ${addedBy} added "${song}"`);
+  });
+
+  // Delete song — only by person who added it
+  socket.on("delete_song", ({ songId, userId }) => {
+    const song = appState.playlist.find((s) => s.id === songId);
+    if (!song) return;
+    if (song.addedBy !== userId) return; // can only delete own songs
+    appState.playlist = appState.playlist.filter((s) => s.id !== songId);
     writeState(appState);
     io.emit("state_update", appState);
   });
